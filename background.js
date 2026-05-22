@@ -1195,6 +1195,9 @@ const DEFAULT_STATE = {
   plusCheckoutCountry: 'DE',
   plusCheckoutCurrency: 'EUR',
   plusCheckoutSource: '',
+  plusCheckoutAlreadyPaid: false,
+  plusCheckoutAlreadyPaidAt: 0,
+  plusCheckoutAlreadyPaidReason: '',
   hostedCheckoutCurrentSmsEntry: null,
   plusBillingCountryText: '',
   plusBillingAddress: null,
@@ -9870,6 +9873,11 @@ function isPlusCheckoutNonFreeTrialFailure(error) {
   return /PLUS_CHECKOUT_NON_FREE_TRIAL::|今日应付金额不是\s*0|没有免费试用资格|该账号已经开通过\s*ChatGPT\s*订阅套餐，不能重复订阅(?:。)?(?:（\s*checkout_order\s*）|\(\s*checkout_order\s*\))?/i.test(message);
 }
 
+function isPlusCheckoutAlreadyPaidFailure(error) {
+  const message = getErrorMessage(error);
+  return /(?:云端支付转换失败[:：]\s*)?User\s+is\s+already\s+paid/i.test(message);
+}
+
 function isGpcTaskEndedFailure(error) {
   const message = String(typeof error === 'string' ? error : error?.message || '');
   return /GPC_TASK_ENDED::/i.test(message);
@@ -9900,7 +9908,7 @@ function isPlusCheckoutRestartStep(step, stepExecutionKey = '', state = {}) {
 }
 
 function isPlusCheckoutRestartRequiredFailure(error) {
-  return !isPlusCheckoutNonFreeTrialFailure(error);
+  return !isPlusCheckoutNonFreeTrialFailure(error) && !isPlusCheckoutAlreadyPaidFailure(error);
 }
 
 function isGoPayCheckoutRestartRequiredFailure(error) {
@@ -9989,6 +9997,9 @@ function getDownstreamStateResets(step, state = {}) {
     plusCheckoutCountry: 'DE',
     plusCheckoutCurrency: 'EUR',
     plusCheckoutSource: '',
+    plusCheckoutAlreadyPaid: false,
+    plusCheckoutAlreadyPaidAt: 0,
+    plusCheckoutAlreadyPaidReason: '',
     plusBillingCountryText: '',
     plusBillingAddress: null,
     plusPaypalApprovedAt: null,
@@ -11062,10 +11073,11 @@ async function handleStepData(step, payload) {
         const latestState = await getState();
         const step3NodeId = getNodeIdByStepForState(3, latestState);
         const step3Status = step3NodeId ? latestState.nodeStatuses?.[step3NodeId] : '';
+        await setState({ signupVerificationRequestedAt: Date.now() });
         if (step3NodeId && step3Status !== 'running' && step3Status !== 'completed' && step3Status !== 'manual_completed') {
           await setNodeStatus(step3NodeId, 'skipped');
           const identityLabel = payload.accountIdentifierType === 'phone' ? '手机号' : '邮箱';
-          await addLog(`步骤 2：提交${identityLabel}后页面直接进入验证码页，已自动跳过步骤 3。`, 'warn');
+          await addLog(`步骤 2：提交${identityLabel}后页面直接进入验证码页，已自动跳过步骤 3，马上开始取验证码。`, 'warn');
         }
       }
       break;
@@ -11653,6 +11665,51 @@ async function runAutoNodeActionWithIdleLogWatchdog(nodeId, action, options = {}
     throw error;
   } finally {
     watchdog.cancel();
+  }
+}
+
+async function skipFillPasswordIfSignupVerificationPageReady(options = {}) {
+  const signupTabId = await getTabId('signup-page');
+  if (!signupTabId) {
+    return false;
+  }
+
+  const state = await getState();
+  const fillPasswordStatus = String(state?.nodeStatuses?.['fill-password'] || '').trim();
+  if (isStepDoneStatus(fillPasswordStatus) || fillPasswordStatus === 'running') {
+    return false;
+  }
+
+  try {
+    await ensureContentScriptReadyOnTab('signup-page', signupTabId, {
+      inject: SIGNUP_PAGE_INJECT_FILES,
+      injectSource: 'signup-page',
+      timeoutMs: 8000,
+      retryDelayMs: 500,
+      logMessage: options.logMessage || '自动运行：正在确认 Step 2 后页面是否已直接进入验证码页...',
+    });
+
+    const result = await sendToContentScriptResilient('signup-page', {
+      type: 'GET_SIGNUP_ENTRY_STATE',
+      step: 3,
+      source: 'background',
+      payload: {},
+    }, {
+      timeoutMs: 8000,
+      retryDelayMs: 500,
+    });
+    const pageState = String(result?.state || '').trim();
+    if (pageState !== 'verification_page') {
+      return false;
+    }
+
+    await setNodeStatus('fill-password', 'skipped');
+    await setState({ signupVerificationRequestedAt: Date.now() });
+    await addLog('Step 2 后已直接进入验证码页，已跳过 Step 3，马上开始取验证码。', 'warn');
+    return true;
+  } catch (error) {
+    await addLog(`自动运行：Step 3 前验证码页探测失败，将继续执行原 Step 3 兜底逻辑：${getErrorMessage(error)}`, 'warn');
+    return false;
   }
 }
 
@@ -13233,6 +13290,7 @@ async function runAutoSequenceFromNodeGraph(startNodeId, context = {}) {
   let restartFromStep1WithCurrentEmail = false;
 
   if (await shouldRunNamedNode('fill-password')) {
+    await skipFillPasswordIfSignupVerificationPageReady();
     const latestState = await getState();
     const fillPasswordStatus = getNodeStatusForNode(latestState, 'fill-password');
     await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：阶段 2，填写密码、验证、登录并完成授权（第 ${attemptRuns} 次尝试）===`, 'info');

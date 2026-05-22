@@ -28,6 +28,7 @@ if (document.documentElement.getAttribute(SIGNUP_PAGE_LISTENER_SENTINEL) !== '1'
       || message.type === 'GET_LOGIN_AUTH_STATE'
       || message.type === 'SUBMIT_ADD_EMAIL'
       || message.type === 'GET_STEP5_SUBMIT_STATE'
+      || message.type === 'GET_SIGNUP_ENTRY_STATE'
       || message.type === 'PREPARE_SIGNUP_VERIFICATION'
       || message.type === 'RECOVER_AUTH_RETRY_PAGE'
       || message.type === 'RECOVER_STEP5_SUBMIT_RETRY_PAGE'
@@ -120,6 +121,8 @@ async function handleCommand(message) {
       return await submitAddEmailAndContinue(message.payload);
     case 'GET_STEP5_SUBMIT_STATE':
       return getStep5SubmitState();
+    case 'GET_SIGNUP_ENTRY_STATE':
+      return getSignupEntryStateSummary(inspectSignupEntryState());
     case 'PREPARE_SIGNUP_VERIFICATION':
       return await prepareSignupVerificationFlow(message.payload);
     case 'RECOVER_AUTH_RETRY_PAGE':

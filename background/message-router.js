@@ -317,6 +317,49 @@
       return String(nodeIds[currentIndex + 1] || '').trim();
     }
 
+    function isPlusCheckoutAlreadyPaidPayload(payload = {}) {
+      if (payload?.plusCheckoutAlreadyPaid || payload?.skipCheckoutBilling) {
+        return true;
+      }
+      return /User\s+is\s+already\s+paid/i.test(String(payload?.plusCheckoutAlreadyPaidReason || payload?.reason || ''));
+    }
+
+    const PLUS_ALREADY_PAID_PAYMENT_NODE_IDS = new Set([
+      'plus-checkout-billing',
+      'paypal-approve',
+      'plus-checkout-return',
+      'gopay-subscription-confirm',
+    ]);
+
+    async function skipPaymentNodesAfterAlreadyPaid(state = {}) {
+      if (typeof getNodeIdsForState !== 'function') {
+        return [];
+      }
+      const nodeIds = Array.isArray(getNodeIdsForState(state)) ? getNodeIdsForState(state) : [];
+      const checkoutCreateIndex = nodeIds.indexOf('plus-checkout-create');
+      if (checkoutCreateIndex < 0) {
+        return [];
+      }
+      const skippedNodeIds = [];
+      for (let index = checkoutCreateIndex + 1; index < nodeIds.length; index += 1) {
+        const nodeId = String(nodeIds[index] || '').trim();
+        if (!PLUS_ALREADY_PAID_PAYMENT_NODE_IDS.has(nodeId)) {
+          break;
+        }
+        const currentState = await getState();
+        const currentStatus = String(currentState.nodeStatuses?.[nodeId] || '').trim();
+        if (isStepProtectedFromAutoSkip(currentStatus)) {
+          continue;
+        }
+        await setNodeStatus(nodeId, 'skipped');
+        skippedNodeIds.push(nodeId);
+      }
+      if (skippedNodeIds.length) {
+        await addLog(`Step 6 已确认当前账号为已付费状态，已自动跳过支付后续节点：${skippedNodeIds.join('、')}，继续后续流程。`, 'warn');
+      }
+      return skippedNodeIds;
+    }
+
     function getLastNodeIdForState(state = {}) {
       if (typeof getNodeIdsForState !== 'function') {
         return '';
@@ -790,6 +833,9 @@
 
       if (stepKey === 'plus-checkout-create') {
         const latestState = await getState();
+        if (isPlusCheckoutAlreadyPaidPayload(payload)) {
+          await skipPaymentNodesAfterAlreadyPaid(latestState);
+        }
         if (getLastNodeIdForState(latestState) === 'plus-checkout-create') {
           await handlePlatformVerifyStepData(payload);
         }
@@ -835,10 +881,11 @@
           if (payload.skippedPasswordStep) {
             const latestState = await getState();
             const step3Status = getNodeStatusByStep(3, latestState);
+            await setState({ signupVerificationRequestedAt: Date.now() });
             if (step3Status !== 'running' && step3Status !== 'completed' && step3Status !== 'manual_completed') {
               await setNodeStatusByStep(3, 'skipped', latestState);
               const identityLabel = payload.accountIdentifierType === 'phone' ? '手机号' : '邮箱';
-              await addLog(`步骤 2：提交${identityLabel}后页面直接进入验证码页，已自动跳过步骤 3。`, 'warn');
+              await addLog(`步骤 2：提交${identityLabel}后页面直接进入验证码页，已自动跳过步骤 3，马上开始取验证码。`, 'warn');
             }
           }
           break;

@@ -91,6 +91,7 @@
       getState = null,
       hostedCheckoutPlanVerifyIntervalMs = HOSTED_CHECKOUT_PAID_PLAN_VERIFY_INTERVAL_MS,
       hostedCheckoutPlanVerifyTimeoutMs = HOSTED_CHECKOUT_PAID_PLAN_VERIFY_TIMEOUT_MS,
+      markCurrentRegistrationAccountUsed = null,
       registerTab,
       restoreCheckoutScopedProxySnapshot = null,
       sendTabMessageUntilStopped,
@@ -280,6 +281,10 @@
         return String(value.message || value.detail || value.error || JSON.stringify(value)).trim() || fallback;
       }
       return String(value ?? fallback).trim() || fallback;
+    }
+
+    function isCloudCheckoutAlreadyPaidDetail(value = '') {
+      return /User\s+is\s+already\s+paid/i.test(String(value || ''));
     }
 
     function normalizeCheckoutConversionProxyProtocol(value = '') {
@@ -1951,12 +1956,19 @@
           const message = error?.message || String(error || 'hosted checkout automation failed');
           if (isHostedCheckoutNonFreeTrialFailure(error)) {
             const stopReason = stripHostedCheckoutNonFreeTrialPrefix(message)
-              || '步骤 6：检测到当前账号没有免费试用资格，已自动停止整个流程。';
+              || '步骤 6：检测到当前账号没有免费试用资格，本轮将结束并继续下一轮。';
             await addLog(stopReason, 'warn');
-            if (typeof requestStop === 'function') {
-              await requestStop({ logMessage: false });
-              return;
+            if (typeof markCurrentRegistrationAccountUsed === 'function') {
+              const latestState = typeof getState === 'function' ? await getState().catch(() => ({})) : {};
+              await markCurrentRegistrationAccountUsed(latestState, {
+                reason: 'plus-checkout-non-free-trial',
+                logPrefix: 'Plus Checkout：当前账号没有免费试用资格',
+              });
             }
+            if (typeof failNodeFromBackground === 'function') {
+              await failNodeFromBackground('plus-checkout-create', `PLUS_CHECKOUT_NON_FREE_TRIAL::${stopReason}`);
+            }
+            return;
           }
           await addLog(`步骤 6：hosted checkout 自动化失败：${message}`, 'error');
           if (typeof failNodeFromBackground === 'function') {
@@ -2305,6 +2317,22 @@
           data?.detail || data?.message || data?.error,
           `HTTP ${response?.status || 0}`
         );
+        if (isCloudCheckoutAlreadyPaidDetail(detail)) {
+          return {
+            checkoutUrl: '',
+            chatgptCheckoutUrl: '',
+            checkoutSessionId: '',
+            processorEntity: '',
+            hostedCheckoutUrl: '',
+            convertedCheckoutUrl: '',
+            preferredCheckoutUrl: '',
+            country: billingDetails.country,
+            currency: billingDetails.currency,
+            checkoutSource: 'cloud-converted-checkout-already-paid',
+            alreadyPaid: true,
+            alreadyPaidReason: detail,
+          };
+        }
         throw new Error(`步骤 6：云端支付转换失败：${detail}`);
       }
 
@@ -2514,6 +2542,30 @@
           || result?.checkoutUrl
           || ''
         ).trim();
+        if (result?.alreadyPaid) {
+          const alreadyPaidReason = String(result.alreadyPaidReason || 'User is already paid').trim();
+          await setState({
+            plusCheckoutTabId: null,
+            plusCheckoutUrl: '',
+            plusCheckoutCountry: result.country || 'US',
+            plusCheckoutCurrency: result.currency || 'USD',
+            plusReturnUrl: '',
+            plusCheckoutSource: result.checkoutSource || 'cloud-converted-checkout-already-paid',
+            plusCheckoutAlreadyPaid: true,
+            plusCheckoutAlreadyPaidAt: Date.now(),
+            plusCheckoutAlreadyPaidReason: alreadyPaidReason,
+          });
+          await addLog(`步骤 6：云端支付转换返回 ${alreadyPaidReason}，判断当前账号已具备 Plus，将跳过支付链接创建并继续后续流程。`, 'ok');
+          await completeNodeFromBackground('plus-checkout-create', {
+            plusCheckoutCountry: result.country || 'US',
+            plusCheckoutCurrency: result.currency || 'USD',
+            plusCheckoutSource: result.checkoutSource || 'cloud-converted-checkout-already-paid',
+            plusCheckoutAlreadyPaid: true,
+            plusCheckoutAlreadyPaidReason: alreadyPaidReason,
+            skipCheckoutBilling: true,
+          });
+          return;
+        }
         if (!targetCheckoutUrl) {
           throw new Error(`步骤 6：${checkoutModeLabel}未返回可用的订阅链接。`);
         }
@@ -2554,6 +2606,9 @@
           plusCheckoutCountry: result.country || 'DE',
           plusCheckoutCurrency: result.currency || 'EUR',
           plusReturnUrl: '',
+          plusCheckoutAlreadyPaid: false,
+          plusCheckoutAlreadyPaidAt: 0,
+          plusCheckoutAlreadyPaidReason: '',
           plusCheckoutSource: result.checkoutSource
             || (targetCheckoutUrl === String(result?.convertedCheckoutUrl || '').trim()
               ? 'converted-chatgpt-checkout'
@@ -2575,6 +2630,20 @@
           plusCheckoutCountry: result.country || 'DE',
           plusCheckoutCurrency: result.currency || 'EUR',
         });
+      } catch (error) {
+        if (isHostedCheckoutNonFreeTrialFailure(error)) {
+          const stopReason = stripHostedCheckoutNonFreeTrialPrefix(getErrorMessage(error))
+            || '步骤 6：检测到当前账号没有免费试用资格，本轮将结束并继续下一轮。';
+          if (typeof markCurrentRegistrationAccountUsed === 'function') {
+            const latestState = typeof getState === 'function' ? await getState().catch(() => state) : state;
+            await markCurrentRegistrationAccountUsed(latestState || state, {
+              reason: 'plus-checkout-non-free-trial',
+              logPrefix: 'Plus Checkout：当前账号没有免费试用资格',
+            });
+          }
+          throw new Error(`PLUS_CHECKOUT_NON_FREE_TRIAL::${stopReason}`);
+        }
+        throw error;
       } finally {
         if (checkoutScopedProxySnapshot?.applied) {
           try {

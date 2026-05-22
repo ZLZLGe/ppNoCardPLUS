@@ -1707,10 +1707,6 @@
           logPrefix: 'Plus Checkout：当前账号没有免费试用资格',
         });
       }
-      if (typeof requestStop === 'function') {
-        await requestStop({ logMessage: false });
-        throw new Error('流程已被用户停止。');
-      }
       throw new Error(`PLUS_CHECKOUT_NON_FREE_TRIAL::${stopReason}`);
     }
 
@@ -1807,6 +1803,15 @@
     async function executePlusCheckoutBilling(state = {}) {
       if (isGpcHelperCheckout(state)) {
         await executeGpcHelperBilling(state);
+        return;
+      }
+      if (state?.plusCheckoutAlreadyPaid) {
+        await addLog('步骤 7：检测到 Step 6 已确认当前账号为已付费状态，跳过账单填写并继续后续流程。', 'ok');
+        await completeNodeFromBackground('plus-checkout-billing', {
+          plusCheckoutAlreadyPaid: true,
+          plusCheckoutAlreadyPaidReason: state.plusCheckoutAlreadyPaidReason || 'User is already paid',
+          skippedBilling: true,
+        });
         return;
       }
       const paymentMethod = normalizePlusPaymentMethod(state?.plusPaymentMethod);
