@@ -4738,6 +4738,144 @@ function findHotmailAccount(accounts, accountId) {
   return normalizeHotmailAccounts(accounts).find((account) => account.id === accountId) || null;
 }
 
+function findHotmailAccountByEmailOrAlias(accounts, email = '') {
+  const normalizedEmail = normalizeEmailAddressForMatch(email);
+  if (!normalizedEmail) {
+    return null;
+  }
+
+  return normalizeHotmailAccounts(accounts).find((account) => {
+    const accountEmail = normalizeEmailAddressForMatch(account.email);
+    if (!accountEmail) {
+      return false;
+    }
+    return accountEmail === normalizedEmail || isOutlookPlusAliasForAccount(normalizedEmail, account);
+  }) || null;
+}
+
+function isUsableHotmailPollingAccount(account) {
+  return Boolean(account)
+    && Boolean(account.enabled)
+    && account.status === 'authorized'
+    && Boolean(account.refreshToken);
+}
+
+function resolveHotmailAccountFromStateForPolling(state = {}) {
+  const accounts = normalizeHotmailAccounts(state.hotmailAccounts);
+  const currentAccount = findHotmailAccount(accounts, state.currentHotmailAccountId);
+  if (isUsableHotmailPollingAccount(currentAccount)) {
+    return currentAccount;
+  }
+
+  const emailMatchedAccount = findHotmailAccountByEmailOrAlias(accounts, state.email);
+  if (isUsableHotmailPollingAccount(emailMatchedAccount)) {
+    return emailMatchedAccount;
+  }
+
+  return accounts.find(isUsableHotmailPollingAccount) || null;
+}
+
+function isAvailableHotmailBaseSignupAccount(account) {
+  return Boolean(account)
+    && Boolean(account.enabled)
+    && account.status === 'authorized'
+    && !account.used
+    && Boolean(account.refreshToken);
+}
+
+function isHotmailBaseEmailForAccount(account, email = '') {
+  const accountEmail = normalizeEmailAddressForMatch(account?.email);
+  const normalizedEmail = normalizeEmailAddressForMatch(email);
+  return Boolean(accountEmail && normalizedEmail && accountEmail === normalizedEmail);
+}
+
+function pickHotmailBaseSignupAccountForRun(state = {}) {
+  const accounts = normalizeHotmailAccounts(state.hotmailAccounts);
+  const currentAccount = findHotmailAccount(accounts, state.currentHotmailAccountId);
+  if (isAvailableHotmailBaseSignupAccount(currentAccount)) {
+    return {
+      account: currentAccount,
+      reused: true,
+    };
+  }
+
+  const emailMatchedAccount = accounts.find((account) => (
+    isAvailableHotmailBaseSignupAccount(account)
+    && isHotmailBaseEmailForAccount(account, state.email)
+  ));
+  if (emailMatchedAccount) {
+    return {
+      account: emailMatchedAccount,
+      reused: true,
+    };
+  }
+
+  const account = accounts
+    .filter(isAvailableHotmailBaseSignupAccount)
+    .sort(compareHotmailAccountAllocationPriority)[0] || null;
+  return {
+    account,
+    reused: false,
+  };
+}
+
+async function resolveHotmailBaseSignupIdentityForRun(state = {}, options = {}) {
+  const currentState = state && typeof state === 'object' ? state : await getState();
+  const { account, reused } = pickHotmailBaseSignupAccountForRun(currentState);
+  if (!account) {
+    throw new Error('没有可用的 Hotmail 账号。请先在侧边栏添加至少一个已校验、未使用且带刷新令牌（refresh token）的账号。');
+  }
+
+  const selectedAccount = await setCurrentHotmailAccount(account.id, {
+    markUsed: Boolean(options.markUsed),
+    syncEmail: false,
+  });
+  await setEmailStateSilently(selectedAccount.email || null, { source: 'hotmail-base-email' });
+  return {
+    ...selectedAccount,
+    registrationAliasEmail: selectedAccount.email,
+    reused,
+  };
+}
+
+async function resolveHotmailSignupIdentityForRun(state = {}, options = {}) {
+  const currentState = state && typeof state === 'object' ? state : await getState();
+  if (!Boolean(currentState.hotmailAliasEnabled)) {
+    return resolveHotmailBaseSignupIdentityForRun(currentState, options);
+  }
+
+  const existingAccount = resolveHotmailAccountFromStateForPolling(currentState);
+  const existingEmail = String(currentState.email || '').trim();
+
+  if (existingAccount && existingEmail) {
+    const isExistingAlias = isOutlookPlusAliasForAccount(existingEmail, existingAccount);
+    if (isExistingAlias && !isHotmailAliasUsed(currentState.hotmailAliasUsage, existingAccount, existingEmail)) {
+      await setCurrentHotmailAccount(existingAccount.id, {
+        markUsed: Boolean(options.markUsed),
+        syncEmail: false,
+      });
+      return {
+        ...existingAccount,
+        registrationAliasEmail: existingEmail,
+        reused: true,
+      };
+    }
+  }
+
+  await addLog(
+    Boolean(currentState.hotmailAliasEnabled)
+      ? 'Hotmail：当前注册邮箱不可复用，进入 Hotmail alias 分配...'
+      : 'Hotmail：当前注册邮箱不可复用，进入 Hotmail 正式账号分配...',
+    'info'
+  );
+
+  return ensureHotmailAccountForFlow({
+    allowAllocate: true,
+    markUsed: Boolean(options.markUsed),
+    preferredAccountId: currentState.currentHotmailAccountId || null,
+  });
+}
+
 function isHotmailProvider(stateOrProvider) {
   const provider = typeof stateOrProvider === 'string'
     ? stateOrProvider
@@ -5735,12 +5873,10 @@ async function testHotmailAccountMailAccess(accountId) {
 
 async function pollHotmailVerificationCode(step, state, pollPayload = {}) {
   await addLog(`步骤 ${step}：正在确定 Hotmail 收信账号...`, 'info');
-  let account = await ensureHotmailAccountForFlow({
-    allowAllocate: true,
-    markUsed: false,
-    preferredAccountId: state.currentHotmailAccountId || null,
-    allowUsedCurrent: true,
-  });
+  let account = resolveHotmailAccountFromStateForPolling(state);
+  if (!account) {
+    throw new Error(`步骤 ${step}：没有可用的当前 Hotmail 收信账号，请先完成 Hotmail 预校验或重新执行注册邮箱提交。`);
+  }
   await addLog(`步骤 ${step}：当前使用 Hotmail 账号 ${account.email} 轮询收件箱。`, 'info');
 
   const serviceSettings = getHotmailServiceSettings(state);
@@ -11052,6 +11188,9 @@ const AUTO_RUN_BACKGROUND_COMPLETED_STEP_KEYS = new Set([
   'post-bound-email-phone-verification',
   'confirm-oauth',
 ]);
+const FINAL_NODE_SIDE_EFFECTS_BEFORE_NOTIFY = new Set([
+  'local-cpa-json-export',
+]);
 const STEP_COMPLETION_SIGNAL_STEP_KEYS = new Set([
   'fill-password',
   'fill-profile',
@@ -11277,6 +11416,11 @@ async function completeNodeFromBackground(nodeId, payload = {}) {
   await addLog('已完成', 'ok', { nodeId: normalizedNodeId });
 
   if (normalizedNodeId === lastNodeId) {
+    if (FINAL_NODE_SIDE_EFFECTS_BEFORE_NOTIFY.has(normalizedNodeId)) {
+      await runCompletedNodeSideEffects(normalizedNodeId, payload, completionState, lastNodeId);
+      notifyNodeComplete(normalizedNodeId, payload);
+      return;
+    }
     notifyNodeComplete(normalizedNodeId, payload);
     void runCompletedNodeSideEffects(normalizedNodeId, payload, completionState, lastNodeId)
       .catch((error) => reportCompletedNodeSideEffectError(normalizedNodeId, error));
@@ -12732,144 +12876,17 @@ function shouldStopEmailAutoFetchRetries(generator, error) {
 async function ensureAutoEmailReady(targetRun, totalRuns, attemptRuns) {
   const currentState = await getState();
   if (isHotmailProvider(currentState)) {
-    const account = await ensureHotmailAccountForFlow({
-      allowAllocate: true,
+    const account = await resolveHotmailSignupIdentityForRun(currentState, {
       markUsed: true,
-      preferredAccountId: null,
     });
-    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：已分配 Hotmail 账号 ${account.email}（第 ${attemptRuns} 次尝试）===`, 'ok');
-    return account.registrationAliasEmail || (await getState()).email || account.email;
-  }
-
-  if (isLuckmailProvider(currentState)) {
-    const purchase = await ensureLuckmailPurchaseForFlow({ allowReuse: true });
-    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：LuckMail 邮箱已就绪：${purchase.email_address}（第 ${attemptRuns} 次尝试）===`, 'ok');
-    return purchase.email_address;
-  }
-
-  if (isGeneratedAliasProvider(currentState)) {
-    if (currentState.mailProvider === GMAIL_PROVIDER) {
-      if (!currentState.emailPrefix) {
-        throw new Error('Gmail 原邮箱未设置，请先在侧边栏填写。');
-      }
-      await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：Gmail +tag 模式已启用，将在步骤 3 自动生成邮箱（第 ${attemptRuns} 次尝试）===`, 'info');
-      return null;
-    }
-    if (!currentState.emailPrefix) {
-      throw new Error('2925 邮箱前缀未设置，请先在侧边栏填写。');
-    }
-    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：2925 模式已启用，将在步骤 3 自动生成邮箱（第 ${attemptRuns} 次尝试）===`, 'info');
-    return null;
-  }
-
-  if (currentState.email) {
-    return currentState.email;
-  }
-
-  if (isCustomMailProvider(currentState)) {
-    const poolSize = getCustomMailProviderPool(currentState).length;
-    if (poolSize > 0) {
-      const queuedEmail = getCustomMailProviderPoolEmailForRun(currentState, targetRun);
-      if (!queuedEmail) {
-        throw new Error(`自定义邮箱号池第 ${targetRun} 个邮箱不存在，请检查号池数量是否与自动轮数一致。`);
-      }
-      await setEmailState(queuedEmail);
-      await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：自定义邮箱号池已就绪：${queuedEmail}（第 ${attemptRuns} 次尝试；第 4/8 步仍需手动输入验证码）===`, 'ok');
-      return queuedEmail;
-    }
-  }
-
-  if (isCustomEmailPoolGenerator(currentState)) {
-    const queuedEmail = getCustomEmailPoolEmailForRun(currentState, targetRun);
-    if (!queuedEmail) {
-      const poolSize = getCustomEmailPool(currentState).length;
-      throw new Error(
-        poolSize > 0
-          ? `自定义邮箱池第 ${targetRun} 个邮箱不存在，请检查邮箱池数量是否与自动轮数一致。`
-          : '自定义邮箱池为空，请先至少填写 1 个邮箱。'
-      );
-    }
-    await setEmailState(queuedEmail);
-    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：自定义邮箱池已就绪：${queuedEmail}（第 ${attemptRuns} 次尝试）===`, 'ok');
-    return queuedEmail;
-  }
-
-  if (shouldUseCustomRegistrationEmail(currentState)) {
-    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮已暂停：请先填写自定义注册邮箱，然后继续 ===`, 'warn');
-    await broadcastAutoRunStatus('waiting_email', {
-      currentRun: targetRun,
-      totalRuns,
-      attemptRun: attemptRuns,
-    });
-
-    await waitForResume();
-
-    const resumedState = await getState();
-    if (!resumedState.email) {
-      throw new Error('无法继续：当前没有注册邮箱。');
-    }
-    return resumedState.email;
-  }
-
-  const generator = normalizeEmailGenerator(currentState.emailGenerator);
-  const generatorLabel = getEmailGeneratorLabel(generator);
-  let lastError = null;
-  let attemptedFetches = 0;
-  for (let attempt = 1; attempt <= EMAIL_FETCH_MAX_ATTEMPTS; attempt++) {
-    attemptedFetches = attempt;
-    try {
-      if (attempt > 1) {
-        await addLog(`${generatorLabel}：正在进行第 ${attempt}/${EMAIL_FETCH_MAX_ATTEMPTS} 次自动获取重试...`, 'warn');
-      }
-      const generatedEmail = await fetchGeneratedEmail(currentState, {
-        generateNew: generator !== 'icloud' || normalizeIcloudFetchMode(currentState.icloudFetchMode) === 'always_new',
-        generator,
-      });
-      await addLog(
-        `=== 目标 ${targetRun}/${totalRuns} 轮：${generatorLabel}已就绪：${generatedEmail}（第 ${attemptRuns} 次尝试，第 ${attempt}/${EMAIL_FETCH_MAX_ATTEMPTS} 次获取）===`,
-        'ok'
-      );
-      return generatedEmail;
-    } catch (err) {
-      lastError = err;
-      await addLog(`${generatorLabel}自动获取失败（${attempt}/${EMAIL_FETCH_MAX_ATTEMPTS}）：${err.message}`, 'warn');
-      if (generator === 'icloud' && shouldStopIcloudAutoFetchRetries(err)) {
-        await addLog('iCloud：检测到会话/网络异常，本轮将停止重复重试。请先确认 iCloud 页面已登录，再点击“我已登录”或手动粘贴邮箱继续。', 'warn');
-      }
-      if (shouldStopEmailAutoFetchRetries(generator, err)) {
-        break;
-      }
-    }
-  }
-
-  const totalAttempts = Math.max(1, attemptedFetches);
-  await addLog(`${generatorLabel}自动获取已连续失败 ${totalAttempts} 次：${lastError?.message || '未知错误'}`, 'error');
-  await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮已暂停：请先自动获取邮箱或手动粘贴邮箱，然后继续 ===`, 'warn');
-  await broadcastAutoRunStatus('waiting_email', {
-    currentRun: targetRun,
-    totalRuns,
-    attemptRun: attemptRuns,
-  });
-
-  await waitForResume();
-
-  const resumedState = await getState();
-  if (!resumedState.email) {
-    throw new Error('无法继续：当前没有邮箱地址。');
-  }
-  return resumedState.email;
-}
-
-async function ensureAutoEmailReady(targetRun, totalRuns, attemptRuns) {
-  const currentState = await getState();
-  if (isHotmailProvider(currentState)) {
-    const account = await ensureHotmailAccountForFlow({
-      allowAllocate: true,
-      markUsed: true,
-      preferredAccountId: null,
-    });
-    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：已分配 Hotmail 账号 ${account.email}（第 ${attemptRuns} 次尝试）===`, 'ok');
-    return account.registrationAliasEmail || (await getState()).email || account.email;
+    const registrationEmail = account.registrationAliasEmail || (await getState()).email || account.email;
+    await addLog(
+      account.reused
+        ? `=== 目标 ${targetRun}/${totalRuns} 轮：已复用当前 Hotmail 账号 ${account.email}，注册邮箱 ${registrationEmail}（第 ${attemptRuns} 次尝试）===`
+        : `=== 目标 ${targetRun}/${totalRuns} 轮：已分配 Hotmail 账号 ${account.email}，注册邮箱 ${registrationEmail}（第 ${attemptRuns} 次尝试）===`,
+      'ok'
+    );
+    return registrationEmail;
   }
 
   if (isLuckmailProvider(currentState)) {
@@ -13561,6 +13578,7 @@ const signupFlowHelpers = self.MultiPageSignupFlowHelpers?.createSignupFlowHelpe
   ensureMail2925AccountForFlow,
   ensureLuckmailPurchaseForFlow,
   fetchGeneratedEmail,
+  resolveHotmailSignupIdentityForRun,
   getTabId,
   isGeneratedAliasProvider,
   isReusableGeneratedAliasEmail,

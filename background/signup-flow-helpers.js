@@ -11,6 +11,7 @@
       ensureMail2925AccountForFlow,
       ensureLuckmailPurchaseForFlow,
       fetchGeneratedEmail,
+      resolveHotmailSignupIdentityForRun = null,
       isGeneratedAliasProvider,
       isReusableGeneratedAliasEmail,
       isHotmailProvider,
@@ -343,11 +344,13 @@
       let resolvedEmail = state.email;
       let generatedEmailAlreadyPersisted = false;
       if (isHotmailProvider(state)) {
-        const account = await ensureHotmailAccountForFlow({
-          allowAllocate: true,
-          markUsed: true,
-          preferredAccountId: state.currentHotmailAccountId || null,
-        });
+        const account = typeof resolveHotmailSignupIdentityForRun === 'function'
+          ? await resolveHotmailSignupIdentityForRun(state, { markUsed: true })
+          : await ensureHotmailAccountForFlow({
+            allowAllocate: true,
+            markUsed: true,
+            preferredAccountId: state.currentHotmailAccountId || null,
+          });
         resolvedEmail = account.registrationAliasEmail || account.email;
       } else if (isLuckmailProvider(state)) {
         const purchase = await ensureLuckmailPurchaseForFlow({ allowReuse: true });

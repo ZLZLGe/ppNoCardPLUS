@@ -777,6 +777,17 @@
         return;
       }
 
+      if (stepKey === 'local-cpa-json-export') {
+        const latestState = await getState();
+        if (typeof markCurrentRegistrationAccountUsed === 'function') {
+          await markCurrentRegistrationAccountUsed(latestState, {
+            logPrefix: '本地 CPA JSON 无RT 导出成功',
+            level: 'ok',
+          });
+        }
+        return;
+      }
+
       if (stepKey === 'plus-checkout-create') {
         const latestState = await getState();
         if (getLastNodeIdForState(latestState) === 'plus-checkout-create') {
