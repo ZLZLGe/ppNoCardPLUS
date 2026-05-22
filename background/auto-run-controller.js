@@ -613,6 +613,7 @@
             });
 
             if (!useExistingProgress && startNodeId === defaultStartNodeId && typeof ensureHotmailMailboxReadyForAutoRunRound === 'function') {
+              await addLog(`自动运行第 ${targetRun}/${totalRuns} 轮第 ${attemptRun} 次尝试：正在准备 Hotmail 账号预校验...`, 'info');
               await ensureHotmailMailboxReadyForAutoRunRound({
                 targetRun,
                 totalRuns,

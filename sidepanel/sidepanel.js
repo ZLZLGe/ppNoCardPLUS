@@ -12329,7 +12329,9 @@ function updateStatusDisplay(state) {
   }
 
   if (isAutoRunLockedPhase()) {
-    displayStatus.textContent = `${currentAutoRun.phase === 'retrying' ? '自动重试中' : '自动运行中'}${getAutoRunLabel()}`;
+    displayStatus.textContent = currentAutoRun.phase === 'retrying'
+      ? `自动重试中${getAutoRunLabel()}`
+      : `自动运行准备中${getAutoRunLabel()}`;
     statusBar.classList.add('running');
     return;
   }

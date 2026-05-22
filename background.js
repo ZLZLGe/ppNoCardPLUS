@@ -5621,6 +5621,19 @@ async function ensureHotmailMailboxReadyForAutoRunRound(options = {}) {
   let preferredAccountId = state.currentHotmailAccountId || null;
   let lastError = null;
 
+  const pickPrecheckAccount = (candidates) => {
+    const normalizedPreferredId = String(preferredAccountId || '').trim();
+    if (normalizedPreferredId) {
+      const preferredCandidate = candidates.find((candidate) => candidate.id === normalizedPreferredId);
+      if (preferredCandidate) {
+        return preferredCandidate;
+      }
+    }
+    return candidates
+      .slice()
+      .sort(compareHotmailAccountAllocationPriority)[0] || null;
+  };
+
   while (true) {
     throwIfStopped();
     const latestState = await getState();
@@ -5636,50 +5649,52 @@ async function ensureHotmailMailboxReadyForAutoRunRound(options = {}) {
       throw new Error('没有可用的 Hotmail 账号。请先在侧边栏添加至少一个带刷新令牌（refresh token）的账号。');
     }
 
-    let account = null;
-    if (remainingAuthorizedAccounts.length) {
-      account = await ensureHotmailAccountForFlow({
-        allowAllocate: true,
-        markUsed: false,
+    const accountCandidate = remainingAuthorizedAccounts.length
+      ? pickPrecheckAccount(remainingAuthorizedAccounts)
+      : pickPendingHotmailAccountForVerification(latestAccounts, {
         preferredAccountId,
         excludeIds: [...exhaustedAccountIds],
       });
-    } else {
-      const pendingAccount = pickPendingHotmailAccountForVerification(latestAccounts, {
-        preferredAccountId,
-        excludeIds: [...exhaustedAccountIds],
-      });
-      if (!pendingAccount) {
-        throw new Error('没有可用的 Hotmail 账号。请先在侧边栏添加至少一个带刷新令牌（refresh token）的账号。');
-      }
-      account = await setCurrentHotmailAccount(pendingAccount.id, {
-        markUsed: false,
-        syncEmail: true,
-      });
+    if (!accountCandidate) {
+      throw new Error('没有可用的 Hotmail 账号。请先在侧边栏添加至少一个带刷新令牌（refresh token）的账号。');
+    }
+
+    if (!remainingAuthorizedAccounts.length) {
       await addLog(
-        `自动运行${buildRoundLabel()}开始前未找到已校验 Hotmail 账号，正在尝试校验待校验账号 ${account.email}。`,
+        `自动运行${buildRoundLabel()}开始前未找到已校验 Hotmail 账号，正在尝试校验待校验账号 ${accountCandidate.email}。`,
         'warn'
       );
     }
 
     try {
       await addLog(
-        `自动运行${buildRoundLabel()}第 ${attemptRun} 次尝试开始前，正在校验 Hotmail 账号 ${account.email} 的邮箱可用性。`,
+        `自动运行${buildRoundLabel()}第 ${attemptRun} 次尝试开始前，正在切换并校验 Hotmail 账号 ${accountCandidate.email}。`,
         'info'
       );
-      const result = await verifyHotmailAccount(account.id);
+      const account = await setCurrentHotmailAccount(accountCandidate.id, {
+        markUsed: false,
+        syncEmail: false,
+      });
+      const result = typeof quickVerifyHotmailAccount === 'function'
+        ? await quickVerifyHotmailAccount(account.id)
+        : await verifyHotmailAccount(account.id);
+      const verifiedAccount = await setCurrentHotmailAccount(result.account.id, {
+        markUsed: false,
+        syncEmail: false,
+      });
+      await setEmailStateSilently(verifiedAccount.email || null, { source: 'hotmail-precheck' });
       await addLog(
-        `自动运行${buildRoundLabel()}开始前已校验 Hotmail 账号 ${result.account?.email || account.email}，INBOX 当前 ${result.messageCount} 封邮件。`,
+        `自动运行${buildRoundLabel()}开始前已快速校验 Hotmail 账号 ${verifiedAccount.email || result.account?.email || account.email}，INBOX 当前 ${result.messageCount} 封邮件。`,
         'ok'
       );
-      return result.account;
+      return verifiedAccount;
     } catch (error) {
       lastError = error;
-      exhaustedAccountIds.add(account.id);
+      exhaustedAccountIds.add(accountCandidate.id);
       preferredAccountId = null;
       const latestErrorMessage = error?.message || '未知错误';
       await addLog(
-        `自动运行${buildRoundLabel()}开始前校验 Hotmail 账号 ${account.email} 失败：${latestErrorMessage}`,
+        `自动运行${buildRoundLabel()}开始前校验 Hotmail 账号 ${accountCandidate.email} 失败：${latestErrorMessage}`,
         'warn'
       );
       const nextState = await getState();
